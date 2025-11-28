@@ -13,65 +13,45 @@ import OpenAI from "openai";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 
-// Load Libraries safely
 let pdfLib: any;
 try { pdfLib = require("pdf-extraction"); } catch (e) { console.error("Warning: Could not load pdf-extraction."); }
-
 let mammoth: any;
 try { mammoth = require("mammoth"); } catch (e) { console.error("Warning: Could not load mammoth."); }
 
 // --- CONFIGURATION ---
-// FIX: We add '|| ""' to force these to be strings, satisfying TypeScript
 const CALENDAR_ID = process.env.CALENDAR_ID || ""; 
 const EMAIL_USER = process.env.EMAIL_USER || ""; 
 const EMAIL_PASS = process.env.EMAIL_PASS || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const TIME_ZONE = "Asia/Kolkata"; // Hardcoded for IST
 const DOCS_DIR = path.join(process.cwd(), "documents");
 
-// --- GOOGLE AUTH SETUP ---
+// --- AUTH SETUP ---
 const SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/calendar.events"];
 let auth: any;
 
 try {
     if (process.env.GOOGLE_JSON) {
-        console.log("Reading Google Creds...");
         let credentials;
-        
-        // BASE64 CHECK: Decodes the string if you pasted the Base64 version in Render
         if (!process.env.GOOGLE_JSON.trim().startsWith('{')) {
-            console.log("-> Detected Base64 Encoded Credentials.");
             const decoded = Buffer.from(process.env.GOOGLE_JSON, 'base64').toString('utf-8');
             credentials = JSON.parse(decoded);
         } else {
-            console.log("-> Detected Raw JSON.");
             credentials = JSON.parse(process.env.GOOGLE_JSON);
         }
-
         auth = new google.auth.GoogleAuth({ credentials, scopes: SCOPES });
-        console.log("-> Google Creds loaded successfully.");
     } else {
-        // Fallback for local testing if file exists
-        console.log("Loading Google Creds from local file...");
         const KEY_PATH = path.join(process.cwd(), "service_account.json");
-        if (fs.existsSync(KEY_PATH)) {
-            auth = new google.auth.GoogleAuth({ keyFile: KEY_PATH, scopes: SCOPES });
-        } else {
-            console.error("WARNING: No Google Credentials found (Env Var or File).");
-        }
+        if (fs.existsSync(KEY_PATH)) auth = new google.auth.GoogleAuth({ keyFile: KEY_PATH, scopes: SCOPES });
     }
-} catch (error: any) {
-    console.error("CRITICAL AUTH ERROR:", error.message);
-}
+} catch (error: any) { console.error("AUTH ERROR:", error.message); }
 
-// --- INITIALIZE SERVICES ---
 const calendar = google.calendar({ version: "v3", auth });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- HELPER FUNCTIONS ---
+// --- HELPER 1: DOCUMENTS ---
 let documentKnowledge: { filename: string; content: string }[] = [];
-
 async function loadDocuments() {
-  console.log("Loading documents from:", DOCS_DIR);
   if (!fs.existsSync(DOCS_DIR)) fs.mkdirSync(DOCS_DIR);
   const files = fs.readdirSync(DOCS_DIR);
   documentKnowledge = []; 
@@ -80,122 +60,140 @@ async function loadDocuments() {
     try {
       let text = "";
       if (file.toLowerCase().endsWith(".pdf")) {
-        if (!pdfLib) throw new Error("PDF Library missing");
         const dataBuffer = fs.readFileSync(filePath);
         const data = await pdfLib(dataBuffer); text = data.text;
       } else if (file.toLowerCase().endsWith(".docx")) {
-        if (!mammoth) throw new Error("Mammoth Library missing");
-        let extractor = mammoth;
-        if (!extractor.extractRawText && extractor.default) extractor = extractor.default;
-        const result = await extractor.extractRawText({ path: filePath }); text = result.value;
+        const result = await mammoth.extractRawText({ path: filePath }); text = result.value;
       } else if (file.toLowerCase().endsWith(".txt")) {
         text = fs.readFileSync(filePath, "utf-8");
       }
-      if (text) {
-        text = text.replace(/\s+/g, " ").trim(); 
-        documentKnowledge.push({ filename: file, content: text });
-      }
-    } catch (err: any) { console.error(` -> Failed to read ${file}: ${err.message}`); }
+      if (text) documentKnowledge.push({ filename: file, content: text.replace(/\s+/g, " ").trim() });
+    } catch (err) {}
   }
-  console.log(`Total documents available: ${documentKnowledge.length}`);
+  console.log(`Loaded ${documentKnowledge.length} docs.`);
 }
 
+// --- HELPER 2: TIMEZONE AWARE SLOTS ---
 function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   const freeSlots = [];
-  const workStartHour = 9; const workEndHour = 17;
-  const candidateTime = new Date(dateStr); candidateTime.setHours(workStartHour, 0, 0, 0);
-  const endTime = new Date(dateStr); endTime.setHours(workEndHour, 0, 0, 0);
+  
+  const startOfDay = new Date(dateStr); 
+  const endOfDay = new Date(dateStr); 
+  endOfDay.setHours(23, 59, 59);
 
-  while (candidateTime < endTime) {
-    const isBusy = busyEvents.some((event: any) => {
-      const startStr = event.start.dateTime || event.start.date;
-      const endStr = event.end.dateTime || event.end.date;
-      const eventStart = new Date(startStr);
-      const eventEnd = endStr ? new Date(endStr) : new Date(eventStart.getTime() + 30*60000);
-      if (!event.start.dateTime) {
-         const targetDate = new Date(dateStr); return eventStart.getDate() === targetDate.getDate();
-      }
-      return candidateTime >= eventStart && candidateTime < eventEnd;
-    });
-    if (!isBusy) freeSlots.push(candidateTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }));
-    candidateTime.setMinutes(candidateTime.getMinutes() + 30);
+  let candidateTime = new Date(startOfDay.getTime());
+
+  while (candidateTime < endOfDay) {
+    // 1. Convert Current Candidate to IST Hour
+    const istTimeStr = candidateTime.toLocaleString("en-US", { timeZone: TIME_ZONE, hour12: false, hour: "numeric", minute: "numeric" });
+    const [hourStr, minuteStr] = istTimeStr.split(":");
+    
+    // FIX 1: Add fallback '|| "0"' to satisfy TypeScript
+    const hour = parseInt(hourStr || "0");
+
+    // 2. Filter: Only allow 9 AM to 5 PM IST
+    if (hour >= 9 && hour < 17) {
+        const isBusy = busyEvents.some((event: any) => {
+            const eventStart = new Date(event.start.dateTime || event.start.date);
+            const eventEnd = new Date(event.end.dateTime || event.end.date);
+            if (!event.start.dateTime) {
+                return eventStart.toISOString().slice(0,10) === candidateTime.toISOString().slice(0,10);
+            }
+            return candidateTime >= eventStart && candidateTime < eventEnd;
+        });
+
+        if (!isBusy) {
+            const slotLabel = candidateTime.toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit' });
+            freeSlots.push(slotLabel);
+        }
+    }
+    candidateTime = new Date(candidateTime.getTime() + 30 * 60000);
   }
   return freeSlots;
 }
 
-function createICS(title: string, description: string, start: Date, end: Date, location: string = "Online") {
+// --- HELPER 3: EMAIL TRANSPORTER ---
+const createTransporter = () => {
+    // FIX 2: Cast to 'any' to allow 'family: 4' option without TS error
+    return nodemailer.createTransport({
+        host: "smtp.gmail.com",
+        port: 587,
+        secure: false, 
+        auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+        tls: { ciphers: 'SSLv3' },
+        family: 4 // Force IPv4
+    } as any);
+};
+
+function createICS(title: string, start: Date, end: Date) {
     const formatDate = (date: Date) => date.toISOString().replace(/-|:|\.\d+/g, "");
-    return `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//VoiceAgent//NONSGML v1.0//EN\nBEGIN:VEVENT\nUID:${Date.now()}@voiceagent.com\nDTSTAMP:${formatDate(new Date())}\nDTSTART:${formatDate(start)}\nDTEND:${formatDate(end)}\nSUMMARY:${title}\nDESCRIPTION:${description}\nLOCATION:${location}\nEND:VEVENT\nEND:VCALENDAR`;
+    return `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//VoiceAgent//EN\nBEGIN:VEVENT\nUID:${Date.now()}@voiceagent\nDTSTAMP:${formatDate(new Date())}\nDTSTART:${formatDate(start)}\nDTEND:${formatDate(end)}\nSUMMARY:${title}\nEND:VEVENT\nEND:VCALENDAR`;
 }
 
-// --- SERVER SETUP ---
+// --- SERVER ---
 const app = express();
 app.use(cors());
-const mcp = new McpServer({ name: "VoiceAgent", version: "3.6.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "4.1.0" });
 
-// --- TOOLS ---
-
+// TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
-    console.log(`[Check] Checking ${date}`);
     try {
-      const start = new Date(date); start.setHours(0,0,0,0);
-      const end = new Date(date); end.setHours(23,59,59,999);
+      console.log(`[Check] Checking ${date} in ${TIME_ZONE}`);
       const res = await calendar.events.list({
-        calendarId: CALENDAR_ID, timeMin: start.toISOString(), timeMax: end.toISOString(), singleEvents: true, orderBy: 'startTime'
+        calendarId: CALENDAR_ID,
+        timeMin: new Date(date).toISOString(),
+        timeMax: new Date(new Date(date).getTime() + 86400000).toISOString(),
+        timeZone: TIME_ZONE,
+        singleEvents: true, 
+        orderBy: 'startTime'
       });
+      
       const events = res.data.items || [];
       const busyList = events.map((e: any) => {
-        const t = e.start.dateTime ? new Date(e.start.dateTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : "All Day";
+        const t = e.start.dateTime 
+            ? new Date(e.start.dateTime).toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute:'2-digit'}) 
+            : "All Day";
         return `BUSY: ${t} - ${e.summary}`;
       }).join("\n");
+
       const availableSlots = calculateFreeSlots(date, events);
-      return { content: [{ type: "text", text: `STATUS FOR ${date}:\n⛔ BUSY:\n${busyList || "None"}\n✅ AVAILABLE:\n${availableSlots.length > 0 ? availableSlots.join(", ") : "None"}` }] };
-    } catch (e: any) { 
-        console.error("CALENDAR CHECK ERROR:", e);
-        return { content: [{ type: "text", text: "Error checking calendar." }] }; 
-    }
+      
+      return { content: [{ type: "text", text: `STATUS FOR ${date} (${TIME_ZONE}):\n⛔ BUSY:\n${busyList || "None"}\n✅ AVAILABLE:\n${availableSlots.length > 0 ? availableSlots.join(", ") : "None"}` }] };
+    } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
 });
 
-mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string(), durationMinutes: z.number().default(30) }, async ({ title, dateTime, attendeeEmail, durationMinutes }) => {
-    console.log(`[Book] '${title}' for ${attendeeEmail} at ${dateTime}`);
+// TOOL 2: BOOKING
+mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
+      console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
       const start = new Date(dateTime);
-      const end = new Date(start.getTime() + durationMinutes * 60000);
-      
-      console.log("-> Inserting into Calendar...");
+      const end = new Date(start.getTime() + 30 * 60000); 
+
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
         requestBody: {
             summary: `${title} (Guest: ${attendeeEmail})`, 
-            description: `GUEST EMAIL: ${attendeeEmail}\nBooked via Voice Agent.`,
+            description: `GUEST: ${attendeeEmail}\nBooked via Voice Agent.`,
             start: { dateTime: start.toISOString() },
             end: { dateTime: end.toISOString() },
         }
       });
 
-      console.log("-> Sending Email (Port 587)...");
-      // FIX: Use Port 587 (STARTTLS) for reliable Cloud delivery
-      const transporter = nodemailer.createTransport({
-          host: "smtp.gmail.com",
-          port: 587,
-          secure: false, // Must be false for 587
-          auth: { user: EMAIL_USER, pass: EMAIL_PASS }
-      });
-
-      const icsContent = createICS(title, `Meeting with ${attendeeEmail}`, start, end);
+      const transporter = createTransporter();
       await transporter.sendMail({
           from: `"Voice Agent" <${EMAIL_USER}>`, to: attendeeEmail, subject: `Confirmed: ${title}`,
-          text: `Your appointment is confirmed for ${start.toLocaleString()}.`,
-          attachments: [{ filename: 'invite.ics', content: icsContent, contentType: 'text/calendar' }]
+          text: `Confirmed for ${start.toLocaleString("en-US", { timeZone: TIME_ZONE })}.`,
+          attachments: [{ filename: 'invite.ics', content: createICS(title, start, end), contentType: 'text/calendar' }]
       });
 
-      return { content: [{ type: "text", text: `Success! Booked and emailed invite to ${attendeeEmail}.` }] };
+      return { content: [{ type: "text", text: `Success. Booked and emailed ${attendeeEmail}.` }] };
     } catch (error: any) { 
-        console.error("BOOKING/EMAIL ERROR:", error);
-        return { content: [{ type: "text", text: "I tried to book it, but a system error occurred." }] }; 
+        console.error("BOOKING ERROR:", error);
+        return { content: [{ type: "text", text: "Error booking or sending email." }] }; 
     }
 });
 
+// TOOL 3: SEARCH
 mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   const keywords = query.toLowerCase().split(" ").filter(w => w.length > 3);
   const results = documentKnowledge.map(doc => {
@@ -207,43 +205,26 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
+// TOOL 4: EMAIL
 mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }, async ({ to, subject, body }) => {
       try {
-        // FIX: Use Port 587 (STARTTLS) here too
-        const transporter = nodemailer.createTransport({
-            host: "smtp.gmail.com",
-            port: 587,
-            secure: false,
-            auth: { user: EMAIL_USER, pass: EMAIL_PASS }
-        });
+        const transporter = createTransporter();
         await transporter.sendMail({ from: `"Voice Agent" <${EMAIL_USER}>`, to, subject, text: body });
         return { content: [{ type: "text", text: `Email sent.` }] };
-      } catch (error) { 
-          console.error("EMAIL ERROR:", error); 
-          return { content: [{ type: "text", text: "Failed to send email." }] }; 
-      }
+      } catch (error) { return { content: [{ type: "text", text: "Failed to send email." }] }; }
 });
 
+// TOOL 5: AI WRITER
 mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
-      console.log(`[AI-Write] Generating ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
       const relevantDocs = documentKnowledge.filter(d => d.content.toLowerCase().includes(searchKeyword)).slice(0, 2);
       const contextText = relevantDocs.map(d => `[Source: ${d.filename}]\n${d.content}`).join("\n\n").substring(0, 8000); 
-      
       try {
         const completion = await openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: [
-                { role: "system", content: `Write a ${format} about '${topic}' based ONLY on the context.` },
-                { role: "user", content: `CONTEXT:\n${contextText}` }
-            ],
+            model: "gpt-4o", messages: [{ role: "system", content: `Write a ${format}.` }, { role: "user", content: `CONTEXT:\n${contextText}` }]
         });
-        const generatedContent = completion.choices[0]?.message?.content || "Error";
-        return { content: [{ type: "text", text: `I have generated the document. Here is the content:\n\n${generatedContent}\n\nWould you like me to email this to you?` }] };
-      } catch (error: any) { 
-          console.error("OPENAI ERROR:", error);
-          return { content: [{ type: "text", text: "AI Generation failed." }] }; 
-      }
+        return { content: [{ type: "text", text: `Generated:\n\n${completion.choices[0]?.message?.content}` }] };
+      } catch (error) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
 });
 
 let transport: SSEServerTransport;
