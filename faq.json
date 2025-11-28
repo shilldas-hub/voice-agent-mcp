@@ -1,0 +1,18 @@
+[
+  {
+    "keywords": ["refund", "return", "money back"],
+    "answer": "We offer a full refund within 30 days of purchase. You just need to email support."
+  },
+  {
+    "keywords": ["price", "cost", "pricing", "expensive"],
+    "answer": "Our standard plan is $29 per month, and the pro plan is $99 per month."
+  },
+  {
+    "keywords": ["hours", "open", "time"],
+    "answer": "We are open Monday to Friday, from 9 AM to 5 PM Eastern Time."
+  },
+  {
+    "keywords": ["location", "address", "where"],
+    "answer": "Our main office is located at 123 AI Boulevard, San Francisco, California."
+  }
+]
