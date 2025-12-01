@@ -6,8 +6,8 @@ import cors from "cors";
 import { google } from "googleapis";
 import path from "path";
 import fs from "fs";
-import nodemailer from "nodemailer";
 import OpenAI from "openai";
+import { Readable } from "stream"; // Needed for uploading text to Drive
 
 // --- LIBRARY LOADER ---
 import { createRequire } from "module";
@@ -21,13 +21,16 @@ try { mammoth = require("mammoth"); } catch (e) { console.error("Warning: Could 
 // --- CONFIGURATION ---
 const CALENDAR_ID = process.env.CALENDAR_ID || ""; 
 const EMAIL_USER = process.env.EMAIL_USER || ""; 
-const EMAIL_PASS = process.env.EMAIL_PASS || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const TIME_ZONE = "Asia/Kolkata"; // Hardcoded for IST
+const TIME_ZONE = "Asia/Kolkata";
 const DOCS_DIR = path.join(process.cwd(), "documents");
 
-// --- AUTH SETUP ---
-const SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/calendar.events"];
+// --- AUTH SETUP (Added Drive Scope) ---
+const SCOPES = [
+    "https://www.googleapis.com/auth/calendar", 
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/drive" // <--- NEW PERMISSION
+];
 let auth: any;
 
 try {
@@ -46,10 +49,12 @@ try {
     }
 } catch (error: any) { console.error("AUTH ERROR:", error.message); }
 
+// Initialize Clients
 const calendar = google.calendar({ version: "v3", auth });
+const drive = google.drive({ version: "v3", auth }); // <--- NEW CLIENT
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- HELPER 1: DOCUMENTS ---
+// --- HELPERS ---
 let documentKnowledge: { filename: string; content: string }[] = [];
 async function loadDocuments() {
   if (!fs.existsSync(DOCS_DIR)) fs.mkdirSync(DOCS_DIR);
@@ -73,10 +78,8 @@ async function loadDocuments() {
   console.log(`Loaded ${documentKnowledge.length} docs.`);
 }
 
-// --- HELPER 2: TIMEZONE AWARE SLOTS ---
 function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   const freeSlots = [];
-  
   const startOfDay = new Date(dateStr); 
   const endOfDay = new Date(dateStr); 
   endOfDay.setHours(23, 59, 59);
@@ -84,24 +87,17 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   let candidateTime = new Date(startOfDay.getTime());
 
   while (candidateTime < endOfDay) {
-    // 1. Convert Current Candidate to IST Hour
     const istTimeStr = candidateTime.toLocaleString("en-US", { timeZone: TIME_ZONE, hour12: false, hour: "numeric", minute: "numeric" });
     const [hourStr, minuteStr] = istTimeStr.split(":");
-    
-    // FIX 1: Add fallback '|| "0"' to satisfy TypeScript
     const hour = parseInt(hourStr || "0");
 
-    // 2. Filter: Only allow 9 AM to 5 PM IST
     if (hour >= 9 && hour < 17) {
         const isBusy = busyEvents.some((event: any) => {
             const eventStart = new Date(event.start.dateTime || event.start.date);
             const eventEnd = new Date(event.end.dateTime || event.end.date);
-            if (!event.start.dateTime) {
-                return eventStart.toISOString().slice(0,10) === candidateTime.toISOString().slice(0,10);
-            }
+            if (!event.start.dateTime) return eventStart.toISOString().slice(0,10) === candidateTime.toISOString().slice(0,10);
             return candidateTime >= eventStart && candidateTime < eventEnd;
         });
-
         if (!isBusy) {
             const slotLabel = candidateTime.toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit' });
             freeSlots.push(slotLabel);
@@ -112,28 +108,10 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   return freeSlots;
 }
 
-// --- HELPER 3: EMAIL TRANSPORTER ---
-const createTransporter = () => {
-    // FIX 2: Cast to 'any' to allow 'family: 4' option without TS error
-    return nodemailer.createTransport({
-        host: "smtp.gmail.com",
-        port: 587,
-        secure: false, 
-        auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-        tls: { ciphers: 'SSLv3' },
-        family: 4 // Force IPv4
-    } as any);
-};
-
-function createICS(title: string, start: Date, end: Date) {
-    const formatDate = (date: Date) => date.toISOString().replace(/-|:|\.\d+/g, "");
-    return `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//VoiceAgent//EN\nBEGIN:VEVENT\nUID:${Date.now()}@voiceagent\nDTSTAMP:${formatDate(new Date())}\nDTSTART:${formatDate(start)}\nDTEND:${formatDate(end)}\nSUMMARY:${title}\nEND:VEVENT\nEND:VCALENDAR`;
-}
-
 // --- SERVER ---
 const app = express();
 app.use(cors());
-const mcp = new McpServer({ name: "VoiceAgent", version: "4.1.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "5.0.0" });
 
 // TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
@@ -147,28 +125,22 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
         singleEvents: true, 
         orderBy: 'startTime'
       });
-      
       const events = res.data.items || [];
       const busyList = events.map((e: any) => {
-        const t = e.start.dateTime 
-            ? new Date(e.start.dateTime).toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute:'2-digit'}) 
-            : "All Day";
+        const t = e.start.dateTime ? new Date(e.start.dateTime).toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute:'2-digit'}) : "All Day";
         return `BUSY: ${t} - ${e.summary}`;
       }).join("\n");
-
       const availableSlots = calculateFreeSlots(date, events);
-      
       return { content: [{ type: "text", text: `STATUS FOR ${date} (${TIME_ZONE}):\n⛔ BUSY:\n${busyList || "None"}\n✅ AVAILABLE:\n${availableSlots.length > 0 ? availableSlots.join(", ") : "None"}` }] };
     } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
 });
 
-// TOOL 2: BOOKING
+// TOOL 2: BOOKING (Calendar Only - Email Paused)
 mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
       console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
       const start = new Date(dateTime);
       const end = new Date(start.getTime() + 30 * 60000); 
-
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
         requestBody: {
@@ -178,18 +150,10 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
             end: { dateTime: end.toISOString() },
         }
       });
-
-      const transporter = createTransporter();
-      await transporter.sendMail({
-          from: `"Voice Agent" <${EMAIL_USER}>`, to: attendeeEmail, subject: `Confirmed: ${title}`,
-          text: `Confirmed for ${start.toLocaleString("en-US", { timeZone: TIME_ZONE })}.`,
-          attachments: [{ filename: 'invite.ics', content: createICS(title, start, end), contentType: 'text/calendar' }]
-      });
-
-      return { content: [{ type: "text", text: `Success. Booked and emailed ${attendeeEmail}.` }] };
+      return { content: [{ type: "text", text: `Success. Booked on calendar for ${attendeeEmail}.` }] };
     } catch (error: any) { 
         console.error("BOOKING ERROR:", error);
-        return { content: [{ type: "text", text: "Error booking or sending email." }] }; 
+        return { content: [{ type: "text", text: "Error booking slot." }] }; 
     }
 });
 
@@ -205,27 +169,75 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
-// TOOL 4: EMAIL
-mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }, async ({ to, subject, body }) => {
-      try {
-        const transporter = createTransporter();
-        await transporter.sendMail({ from: `"Voice Agent" <${EMAIL_USER}>`, to, subject, text: body });
-        return { content: [{ type: "text", text: `Email sent.` }] };
-      } catch (error) { return { content: [{ type: "text", text: "Failed to send email." }] }; }
-});
-
-// TOOL 5: AI WRITER
-mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
+// TOOL 4: GENERATE GOOGLE DOC (The Upgrade)
+mcp.tool(
+    "generate_collateral",
+    { 
+      topic: z.string().describe("The topic (e.g. 'Refund Policy Summary')"),
+      format: z.string().describe("Format (e.g. 'One-Pager', 'Memo')") 
+    },
+    async ({ topic, format }) => {
+      console.log(`[AI-Write] Creating Google Doc: ${format} about ${topic}...`);
+      
+      // 1. Generate Content via OpenAI
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
       const relevantDocs = documentKnowledge.filter(d => d.content.toLowerCase().includes(searchKeyword)).slice(0, 2);
       const contextText = relevantDocs.map(d => `[Source: ${d.filename}]\n${d.content}`).join("\n\n").substring(0, 8000); 
+
+      let aiContent = "";
       try {
         const completion = await openai.chat.completions.create({
-            model: "gpt-4o", messages: [{ role: "system", content: `Write a ${format}.` }, { role: "user", content: `CONTEXT:\n${contextText}` }]
+            model: "gpt-4o",
+            messages: [
+                { role: "system", content: `You are a professional business writer. Write a ${format}. Use Markdown formatting.` }, 
+                { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }
+            ],
         });
-        return { content: [{ type: "text", text: `Generated:\n\n${completion.choices[0]?.message?.content}` }] };
-      } catch (error) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
-});
+        aiContent = completion.choices[0]?.message?.content || "Error generating text.";
+      } catch (err) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
+
+      // 2. Upload to Google Drive
+      try {
+        const fileMetadata = {
+            name: `${topic} - ${format} (Draft)`,
+            mimeType: 'application/vnd.google-apps.document' // Converts text to Google Doc
+        };
+        const media = {
+            mimeType: 'text/plain',
+            body: aiContent
+        };
+
+        const file = await drive.files.create({
+            requestBody: fileMetadata,
+            media: media,
+            fields: 'id, webViewLink'
+        });
+
+        // 3. Share it with YOU (so you can see it)
+        if (EMAIL_USER) {
+            await drive.permissions.create({
+                fileId: file.data.id!,
+                requestBody: {
+                    role: 'writer',
+                    type: 'user',
+                    emailAddress: EMAIL_USER
+                }
+            });
+        }
+
+        return { 
+            content: [{ 
+                type: "text", 
+                text: `I have created the ${format} as a Google Doc. You can access it here: ${file.data.webViewLink}` 
+            }] 
+        };
+
+      } catch (driveErr: any) {
+          console.error("DRIVE ERROR:", driveErr);
+          return { content: [{ type: "text", text: "I wrote the text, but failed to save it to Google Drive." }] };
+      }
+    }
+);
 
 let transport: SSEServerTransport;
 app.get("/sse", async (req, res) => { transport = new SSEServerTransport("/messages", res); await mcp.connect(transport); });
