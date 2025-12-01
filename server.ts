@@ -7,6 +7,7 @@ import { google } from "googleapis";
 import path from "path";
 import fs from "fs";
 import OpenAI from "openai";
+import PDFDocument from "pdfkit";
 
 // --- LIBRARY LOADER ---
 import { createRequire } from "module";
@@ -106,10 +107,9 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
 // --- SERVER ---
 const app = express();
 app.use(cors());
-// Serve the public folder so files can be downloaded
 app.use('/files', express.static(PUBLIC_DIR));
 
-const mcp = new McpServer({ name: "VoiceAgent", version: "8.0.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "9.1.0" });
 
 // TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
@@ -133,7 +133,7 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
     } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
 });
 
-// TOOL 2: BOOKING (INTERNAL ONLY)
+// TOOL 2: BOOKING
 mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
       console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
@@ -142,13 +142,11 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
 
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
-        // sendUpdates: 'all',  <-- REMOVED TO PREVENT 403 ERROR
         requestBody: {
             summary: `${title} (Guest: ${attendeeEmail})`, 
             description: `GUEST CONTACT: ${attendeeEmail}\nBooked via Voice Agent.`,
             start: { dateTime: start.toISOString() },
             end: { dateTime: end.toISOString() },
-            // attendees: [{ email: attendeeEmail }] <-- REMOVED TO PREVENT 403 ERROR
         }
       });
       
@@ -171,9 +169,9 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
-// TOOL 4: GENERATE COLLATERAL (HOSTED LINK)
+// TOOL 4: GENERATE PDF COLLATERAL
 mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
-      console.log(`[AI-Write] Generating ${format}...`);
+      console.log(`[AI-Write] Generating PDF: ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
       const relevantDocs = documentKnowledge.filter(d => d.content.toLowerCase().includes(searchKeyword)).slice(0, 2);
       const contextText = relevantDocs.map(d => `[Source: ${d.filename}]\n${d.content}`).join("\n\n").substring(0, 8000); 
@@ -182,25 +180,37 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
       try {
         const completion = await openai.chat.completions.create({
             model: "gpt-4o",
-            messages: [{ role: "system", content: `Write a ${format} in Markdown.` }, { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }]
+            messages: [{ role: "system", content: `Write a ${format}. Do not use Markdown symbols like ** or #. Just plain text with clear paragraphs.` }, { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }]
         });
         aiContent = completion.choices[0]?.message?.content || "Error generating text.";
       } catch (err) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
 
       try {
-        const safeName = `${topic.replace(/[^a-z0-9]/gi, '_')}_${format.replace(/[^a-z0-9]/gi, '_')}.txt`;
+        const safeName = `${topic.replace(/[^a-z0-9]/gi, '_')}_${format.replace(/[^a-z0-9]/gi, '_')}.pdf`; 
         const filePath = path.join(PUBLIC_DIR, safeName);
-        fs.writeFileSync(filePath, aiContent);
         
-        // This constructs the URL to your Render server
+        const doc = new PDFDocument();
+        const stream = fs.createWriteStream(filePath);
+        doc.pipe(stream);
+
+        doc.fontSize(20).text(topic.toUpperCase(), { align: 'center' });
+        doc.moveDown();
+        doc.fontSize(12).text(`Format: ${format}`, { align: 'center' });
+        doc.moveDown();
+        doc.fontSize(12).text(aiContent, { align: 'justify', indent: 30, lineGap: 5 });
+        doc.end();
+
+        // FIX: Explicit void resolve
+        await new Promise<void>((resolve) => stream.on('finish', () => resolve()));
+        
         const host = process.env.RENDER_EXTERNAL_HOSTNAME || "your-app.onrender.com";
         const downloadUrl = `https://${host}/files/${safeName}`;
 
-        return { content: [{ type: "text", text: `I have created the document. You can download it here: ${downloadUrl}` }] };
+        return { content: [{ type: "text", text: `I have created a PDF document. You can download it here: ${downloadUrl}` }] };
 
       } catch (err: any) {
-          console.error("FILE SAVE ERROR:", err);
-          return { content: [{ type: "text", text: "Error saving file." }] };
+          console.error("PDF SAVE ERROR:", err);
+          return { content: [{ type: "text", text: "Error saving PDF file." }] };
       }
 });
 
