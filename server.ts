@@ -23,7 +23,7 @@ const CALENDAR_ID = process.env.CALENDAR_ID || "";
 const EMAIL_USER = process.env.EMAIL_USER || ""; 
 const EMAIL_PASS = process.env.EMAIL_PASS || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || ""; // <--- NEW VARIABLE
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || "";
 const TIME_ZONE = "Asia/Kolkata";
 const DOCS_DIR = path.join(process.cwd(), "documents");
 
@@ -109,15 +109,12 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   return freeSlots;
 }
 
-// --- EMAILS ---
+// --- ROBUST EMAILER ---
 const createTransporter = () => {
     return nodemailer.createTransport({
-        service: "gmail",
+        service: "gmail", // Use built-in service to handle handshake
         auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-        connectionTimeout: 10000, 
-        greetingTimeout: 5000,
-        socketTimeout: 10000,
-    } as any);
+    });
 };
 
 function createICS(title: string, start: Date, end: Date) {
@@ -128,9 +125,9 @@ function createICS(title: string, start: Date, end: Date) {
 // --- SERVER ---
 const app = express();
 app.use(cors());
-const mcp = new McpServer({ name: "VoiceAgent", version: "5.1.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "6.0.0" });
 
-// TOOLS 1-4 (Standard)
+// TOOLS 1-4
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
     try {
       console.log(`[Check] Checking ${date} in ${TIME_ZONE}`);
@@ -144,9 +141,7 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
       });
       const events = res.data.items || [];
       const busyList = events.map((e: any) => {
-        const t = e.start.dateTime 
-            ? new Date(e.start.dateTime).toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute:'2-digit'}) 
-            : "All Day";
+        const t = e.start.dateTime ? new Date(e.start.dateTime).toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute:'2-digit'}) : "All Day";
         return `BUSY: ${t} - ${e.summary}`;
       }).join("\n");
       const availableSlots = calculateFreeSlots(date, events);
@@ -159,7 +154,6 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
       console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
       const start = new Date(dateTime);
       const end = new Date(start.getTime() + 30 * 60000); 
-
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
         requestBody: {
@@ -169,17 +163,19 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
             end: { dateTime: end.toISOString() },
         }
       });
-
-      const transporter = createTransporter();
-      await transporter.sendMail({
-          from: `"Voice Agent" <${EMAIL_USER}>`, to: attendeeEmail, subject: `Confirmed: ${title}`,
-          text: `Confirmed for ${start.toLocaleString("en-US", { timeZone: TIME_ZONE })}.`,
-          attachments: [{ filename: 'invite.ics', content: createICS(title, start, end), contentType: 'text/calendar' }]
-      });
-      return { content: [{ type: "text", text: `Success. Booked and emailed ${attendeeEmail}.` }] };
-    } catch (error: any) { 
-        return { content: [{ type: "text", text: "Booked on calendar (Email failed due to network)." }] }; 
-    }
+      // Try Email
+      try {
+          const transporter = createTransporter();
+          await transporter.sendMail({
+              from: `"Voice Agent" <${EMAIL_USER}>`, to: attendeeEmail, subject: `Confirmed: ${title}`,
+              text: `Confirmed for ${start.toLocaleString("en-US", { timeZone: TIME_ZONE })}.`,
+              attachments: [{ filename: 'invite.ics', content: createICS(title, start, end), contentType: 'text/calendar' }]
+          });
+          return { content: [{ type: "text", text: `Success. Booked and emailed.` }] };
+      } catch (e) {
+          return { content: [{ type: "text", text: `Booked on calendar (Email failed).` }] };
+      }
+    } catch (error: any) { return { content: [{ type: "text", text: "Error booking slot." }] }; }
 });
 
 mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
@@ -201,10 +197,9 @@ mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }
       } catch (error) { return { content: [{ type: "text", text: "Failed to send email." }] }; }
 });
 
-// TOOL 5: GENERATE GOOGLE DOC (Updated with Magic Folder)
+// TOOL 5: GENERATE COLLATERAL (WITH FALLBACK)
 mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
-      console.log(`[AI-Write] Creating Google Doc: ${format}...`);
-      
+      console.log(`[AI-Write] Generating ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
       const relevantDocs = documentKnowledge.filter(d => d.content.toLowerCase().includes(searchKeyword)).slice(0, 2);
       const contextText = relevantDocs.map(d => `[Source: ${d.filename}]\n${d.content}`).join("\n\n").substring(0, 8000); 
@@ -213,46 +208,41 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
       try {
         const completion = await openai.chat.completions.create({
             model: "gpt-4o",
-            messages: [{ role: "system", content: `Write a ${format}. Use Markdown.` }, { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }]
+            messages: [{ role: "system", content: `Write a ${format} in Markdown.` }, { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }]
         });
         aiContent = completion.choices[0]?.message?.content || "Error generating text.";
       } catch (err) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
 
+      // --- STRATEGY: DRIVE -> then EMAIL -> then CHAT ---
       try {
-        // --- PREPARE METADATA ---
-        const fileMetadata: any = {
-            name: `${topic} - ${format} (Draft)`,
-            mimeType: 'application/vnd.google-apps.document'
-        };
-
-        // --- THE MAGIC FIX: PUT IT IN THE SHARED FOLDER ---
-        if (DRIVE_FOLDER_ID) {
-            fileMetadata.parents = [DRIVE_FOLDER_ID];
-        }
-
+        // 1. Try Drive
+        const fileMetadata: any = { name: `${topic} - ${format} (Draft)`, mimeType: 'application/vnd.google-apps.document' };
+        if (DRIVE_FOLDER_ID) fileMetadata.parents = [DRIVE_FOLDER_ID];
         const media = { mimeType: 'text/plain', body: aiContent };
-
-        const file = await drive.files.create({
-            requestBody: fileMetadata,
-            media: media,
-            fields: 'id, webViewLink'
-        });
-
-        // Share permission shouldn't be needed if folder is shared, but adding just in case
-        if (EMAIL_USER) {
-            try {
-                await drive.permissions.create({
-                    fileId: file.data.id!,
-                    requestBody: { role: 'writer', type: 'user', emailAddress: EMAIL_USER }
-                });
-            } catch (permErr) { console.log("Permission probably inherited from folder."); }
-        }
-
-        return { content: [{ type: "text", text: `I created the Google Doc in your shared folder. Link: ${file.data.webViewLink}` }] };
+        const file = await drive.files.create({ requestBody: fileMetadata, media: media, fields: 'id, webViewLink' });
+        return { content: [{ type: "text", text: `Created Google Doc: ${file.data.webViewLink}` }] };
 
       } catch (driveErr: any) {
-          console.error("DRIVE ERROR:", driveErr);
-          return { content: [{ type: "text", text: "Storage Error: Please verify you have shared a folder with the agent email." }] };
+          console.error("DRIVE FAILED (Quota). Switching to Email...");
+          
+          // 2. Fallback to Email
+          try {
+              if (EMAIL_USER) {
+                  const transporter = createTransporter();
+                  await transporter.sendMail({
+                      from: `"Voice Agent" <${EMAIL_USER}>`,
+                      to: EMAIL_USER, // Email it to YOU (the admin)
+                      subject: `Draft: ${topic}`,
+                      text: `Google Drive upload failed (Quota), so here is the generated text:\n\n${aiContent}`
+                  });
+                  return { content: [{ type: "text", text: `I couldn't save to Drive (storage full), so I emailed the draft to you instead.` }] };
+              }
+          } catch (emailErr) {
+              console.error("EMAIL FAILED.");
+          }
+          
+          // 3. Last Resort: Return Text
+          return { content: [{ type: "text", text: `I couldn't save to Drive or Email. Here is the draft:\n\n${aiContent.substring(0, 1000)}... (truncated)` }] };
       }
 });
 
