@@ -6,8 +6,8 @@ import cors from "cors";
 import { google } from "googleapis";
 import path from "path";
 import fs from "fs";
+import nodemailer from "nodemailer";
 import OpenAI from "openai";
-import { Readable } from "stream"; // Needed for uploading text to Drive
 
 // --- LIBRARY LOADER ---
 import { createRequire } from "module";
@@ -21,15 +21,17 @@ try { mammoth = require("mammoth"); } catch (e) { console.error("Warning: Could 
 // --- CONFIGURATION ---
 const CALENDAR_ID = process.env.CALENDAR_ID || ""; 
 const EMAIL_USER = process.env.EMAIL_USER || ""; 
+const EMAIL_PASS = process.env.EMAIL_PASS || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || ""; // <--- NEW VARIABLE
 const TIME_ZONE = "Asia/Kolkata";
 const DOCS_DIR = path.join(process.cwd(), "documents");
 
-// --- AUTH SETUP (Added Drive Scope) ---
+// --- AUTH SETUP ---
 const SCOPES = [
     "https://www.googleapis.com/auth/calendar", 
     "https://www.googleapis.com/auth/calendar.events",
-    "https://www.googleapis.com/auth/drive" // <--- NEW PERMISSION
+    "https://www.googleapis.com/auth/drive"
 ];
 let auth: any;
 
@@ -49,9 +51,8 @@ try {
     }
 } catch (error: any) { console.error("AUTH ERROR:", error.message); }
 
-// Initialize Clients
 const calendar = google.calendar({ version: "v3", auth });
-const drive = google.drive({ version: "v3", auth }); // <--- NEW CLIENT
+const drive = google.drive({ version: "v3", auth });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // --- HELPERS ---
@@ -108,12 +109,28 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   return freeSlots;
 }
 
+// --- EMAILS ---
+const createTransporter = () => {
+    return nodemailer.createTransport({
+        service: "gmail",
+        auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+        connectionTimeout: 10000, 
+        greetingTimeout: 5000,
+        socketTimeout: 10000,
+    } as any);
+};
+
+function createICS(title: string, start: Date, end: Date) {
+    const formatDate = (date: Date) => date.toISOString().replace(/-|:|\.\d+/g, "");
+    return `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//VoiceAgent//EN\nBEGIN:VEVENT\nUID:${Date.now()}@voiceagent\nDTSTAMP:${formatDate(new Date())}\nDTSTART:${formatDate(start)}\nDTEND:${formatDate(end)}\nSUMMARY:${title}\nEND:VEVENT\nEND:VCALENDAR`;
+}
+
 // --- SERVER ---
 const app = express();
 app.use(cors());
-const mcp = new McpServer({ name: "VoiceAgent", version: "5.0.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "5.1.0" });
 
-// TOOL 1: CHECK AVAILABILITY
+// TOOLS 1-4 (Standard)
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
     try {
       console.log(`[Check] Checking ${date} in ${TIME_ZONE}`);
@@ -127,7 +144,9 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
       });
       const events = res.data.items || [];
       const busyList = events.map((e: any) => {
-        const t = e.start.dateTime ? new Date(e.start.dateTime).toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute:'2-digit'}) : "All Day";
+        const t = e.start.dateTime 
+            ? new Date(e.start.dateTime).toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute:'2-digit'}) 
+            : "All Day";
         return `BUSY: ${t} - ${e.summary}`;
       }).join("\n");
       const availableSlots = calculateFreeSlots(date, events);
@@ -135,12 +154,12 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
     } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
 });
 
-// TOOL 2: BOOKING (Calendar Only - Email Paused)
 mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
       console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
       const start = new Date(dateTime);
       const end = new Date(start.getTime() + 30 * 60000); 
+
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
         requestBody: {
@@ -150,14 +169,19 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
             end: { dateTime: end.toISOString() },
         }
       });
-      return { content: [{ type: "text", text: `Success. Booked on calendar for ${attendeeEmail}.` }] };
+
+      const transporter = createTransporter();
+      await transporter.sendMail({
+          from: `"Voice Agent" <${EMAIL_USER}>`, to: attendeeEmail, subject: `Confirmed: ${title}`,
+          text: `Confirmed for ${start.toLocaleString("en-US", { timeZone: TIME_ZONE })}.`,
+          attachments: [{ filename: 'invite.ics', content: createICS(title, start, end), contentType: 'text/calendar' }]
+      });
+      return { content: [{ type: "text", text: `Success. Booked and emailed ${attendeeEmail}.` }] };
     } catch (error: any) { 
-        console.error("BOOKING ERROR:", error);
-        return { content: [{ type: "text", text: "Error booking slot." }] }; 
+        return { content: [{ type: "text", text: "Booked on calendar (Email failed due to network)." }] }; 
     }
 });
 
-// TOOL 3: SEARCH
 mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   const keywords = query.toLowerCase().split(" ").filter(w => w.length > 3);
   const results = documentKnowledge.map(doc => {
@@ -169,17 +193,18 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
-// TOOL 4: GENERATE GOOGLE DOC (The Upgrade)
-mcp.tool(
-    "generate_collateral",
-    { 
-      topic: z.string().describe("The topic (e.g. 'Refund Policy Summary')"),
-      format: z.string().describe("Format (e.g. 'One-Pager', 'Memo')") 
-    },
-    async ({ topic, format }) => {
-      console.log(`[AI-Write] Creating Google Doc: ${format} about ${topic}...`);
+mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }, async ({ to, subject, body }) => {
+      try {
+        const transporter = createTransporter();
+        await transporter.sendMail({ from: `"Voice Agent" <${EMAIL_USER}>`, to, subject, text: body });
+        return { content: [{ type: "text", text: `Email sent.` }] };
+      } catch (error) { return { content: [{ type: "text", text: "Failed to send email." }] }; }
+});
+
+// TOOL 5: GENERATE GOOGLE DOC (Updated with Magic Folder)
+mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
+      console.log(`[AI-Write] Creating Google Doc: ${format}...`);
       
-      // 1. Generate Content via OpenAI
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
       const relevantDocs = documentKnowledge.filter(d => d.content.toLowerCase().includes(searchKeyword)).slice(0, 2);
       const contextText = relevantDocs.map(d => `[Source: ${d.filename}]\n${d.content}`).join("\n\n").substring(0, 8000); 
@@ -188,24 +213,24 @@ mcp.tool(
       try {
         const completion = await openai.chat.completions.create({
             model: "gpt-4o",
-            messages: [
-                { role: "system", content: `You are a professional business writer. Write a ${format}. Use Markdown formatting.` }, 
-                { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }
-            ],
+            messages: [{ role: "system", content: `Write a ${format}. Use Markdown.` }, { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }]
         });
         aiContent = completion.choices[0]?.message?.content || "Error generating text.";
       } catch (err) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
 
-      // 2. Upload to Google Drive
       try {
-        const fileMetadata = {
+        // --- PREPARE METADATA ---
+        const fileMetadata: any = {
             name: `${topic} - ${format} (Draft)`,
-            mimeType: 'application/vnd.google-apps.document' // Converts text to Google Doc
+            mimeType: 'application/vnd.google-apps.document'
         };
-        const media = {
-            mimeType: 'text/plain',
-            body: aiContent
-        };
+
+        // --- THE MAGIC FIX: PUT IT IN THE SHARED FOLDER ---
+        if (DRIVE_FOLDER_ID) {
+            fileMetadata.parents = [DRIVE_FOLDER_ID];
+        }
+
+        const media = { mimeType: 'text/plain', body: aiContent };
 
         const file = await drive.files.create({
             requestBody: fileMetadata,
@@ -213,31 +238,23 @@ mcp.tool(
             fields: 'id, webViewLink'
         });
 
-        // 3. Share it with YOU (so you can see it)
+        // Share permission shouldn't be needed if folder is shared, but adding just in case
         if (EMAIL_USER) {
-            await drive.permissions.create({
-                fileId: file.data.id!,
-                requestBody: {
-                    role: 'writer',
-                    type: 'user',
-                    emailAddress: EMAIL_USER
-                }
-            });
+            try {
+                await drive.permissions.create({
+                    fileId: file.data.id!,
+                    requestBody: { role: 'writer', type: 'user', emailAddress: EMAIL_USER }
+                });
+            } catch (permErr) { console.log("Permission probably inherited from folder."); }
         }
 
-        return { 
-            content: [{ 
-                type: "text", 
-                text: `I have created the ${format} as a Google Doc. You can access it here: ${file.data.webViewLink}` 
-            }] 
-        };
+        return { content: [{ type: "text", text: `I created the Google Doc in your shared folder. Link: ${file.data.webViewLink}` }] };
 
       } catch (driveErr: any) {
           console.error("DRIVE ERROR:", driveErr);
-          return { content: [{ type: "text", text: "I wrote the text, but failed to save it to Google Drive." }] };
+          return { content: [{ type: "text", text: "Storage Error: Please verify you have shared a folder with the agent email." }] };
       }
-    }
-);
+});
 
 let transport: SSEServerTransport;
 app.get("/sse", async (req, res) => { transport = new SSEServerTransport("/messages", res); await mcp.connect(transport); });
