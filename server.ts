@@ -22,7 +22,7 @@ const CALENDAR_ID = process.env.CALENDAR_ID || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const TIME_ZONE = "Asia/Kolkata";
 const DOCS_DIR = path.join(process.cwd(), "documents");
-const PUBLIC_DIR = path.join(process.cwd(), "public"); // <--- NEW PUBLIC FOLDER
+const PUBLIC_DIR = path.join(process.cwd(), "public");
 
 // --- AUTH SETUP ---
 const SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/calendar.events"];
@@ -47,10 +47,9 @@ try {
 const calendar = google.calendar({ version: "v3", auth });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- HELPER: ENSURE DIRECTORIES EXIST ---
+// --- HELPERS ---
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR);
 
-// --- HELPER: DOC LOADER ---
 let documentKnowledge: { filename: string; content: string }[] = [];
 async function loadDocuments() {
   if (!fs.existsSync(DOCS_DIR)) fs.mkdirSync(DOCS_DIR);
@@ -107,12 +106,10 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
 // --- SERVER ---
 const app = express();
 app.use(cors());
-
-// *** STATIC FILE SERVER ***
-// This allows files in the 'public' folder to be downloaded via URL
+// Serve the public folder so files can be downloaded
 app.use('/files', express.static(PUBLIC_DIR));
 
-const mcp = new McpServer({ name: "VoiceAgent", version: "7.0.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "8.0.0" });
 
 // TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
@@ -136,7 +133,7 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
     } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
 });
 
-// TOOL 2: BOOKING (NATIVE GOOGLE EMAIL)
+// TOOL 2: BOOKING (INTERNAL ONLY)
 mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
       console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
@@ -145,19 +142,17 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
 
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
-        sendUpdates: 'all', // <--- THE MAGIC FIX: TELLS GOOGLE TO SEND THE INVITE
+        // sendUpdates: 'all',  <-- REMOVED TO PREVENT 403 ERROR
         requestBody: {
-            summary: `${title}`, 
-            description: `Booked via Voice Agent.`,
+            summary: `${title} (Guest: ${attendeeEmail})`, 
+            description: `GUEST CONTACT: ${attendeeEmail}\nBooked via Voice Agent.`,
             start: { dateTime: start.toISOString() },
             end: { dateTime: end.toISOString() },
-            attendees: [
-                { email: attendeeEmail } // <--- GOOGLE WILL EMAIL THIS PERSON
-            ]
+            // attendees: [{ email: attendeeEmail }] <-- REMOVED TO PREVENT 403 ERROR
         }
       });
       
-      return { content: [{ type: "text", text: `Success. I have booked the slot and Google Calendar has sent an invite to ${attendeeEmail}.` }] };
+      return { content: [{ type: "text", text: `Success. I have booked the slot on your calendar. I have noted the guest email (${attendeeEmail}) in the description.` }] };
     } catch (error: any) { 
         console.error("BOOKING ERROR:", error);
         return { content: [{ type: "text", text: "Error booking slot." }] }; 
@@ -176,7 +171,7 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
-// TOOL 4: GENERATE COLLATERAL (HOSTED ON SERVER)
+// TOOL 4: GENERATE COLLATERAL (HOSTED LINK)
 mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
       console.log(`[AI-Write] Generating ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
@@ -192,20 +187,16 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
         aiContent = completion.choices[0]?.message?.content || "Error generating text.";
       } catch (err) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
 
-      // --- SAVE TO PUBLIC FOLDER ---
       try {
         const safeName = `${topic.replace(/[^a-z0-9]/gi, '_')}_${format.replace(/[^a-z0-9]/gi, '_')}.txt`;
         const filePath = path.join(PUBLIC_DIR, safeName);
-        
         fs.writeFileSync(filePath, aiContent);
         
-        // Construct the download URL dynamically
-        // Note: Render sets the host automatically, but we can't always guess it perfectly in code.
-        // We will return a relative path that Vapi can read, or hardcode the base if known.
-        // For now, let's assume we are on the Render URL.
-        const downloadUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || "your-app-name.onrender.com"}/files/${safeName}`;
+        // This constructs the URL to your Render server
+        const host = process.env.RENDER_EXTERNAL_HOSTNAME || "your-app.onrender.com";
+        const downloadUrl = `https://${host}/files/${safeName}`;
 
-        return { content: [{ type: "text", text: `I have created the document. You can view or download it here: ${downloadUrl}` }] };
+        return { content: [{ type: "text", text: `I have created the document. You can download it here: ${downloadUrl}` }] };
 
       } catch (err: any) {
           console.error("FILE SAVE ERROR:", err);
