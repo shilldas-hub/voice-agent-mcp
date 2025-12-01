@@ -6,7 +6,6 @@ import cors from "cors";
 import { google } from "googleapis";
 import path from "path";
 import fs from "fs";
-import nodemailer from "nodemailer";
 import OpenAI from "openai";
 
 // --- LIBRARY LOADER ---
@@ -20,19 +19,13 @@ try { mammoth = require("mammoth"); } catch (e) { console.error("Warning: Could 
 
 // --- CONFIGURATION ---
 const CALENDAR_ID = process.env.CALENDAR_ID || ""; 
-const EMAIL_USER = process.env.EMAIL_USER || ""; 
-const EMAIL_PASS = process.env.EMAIL_PASS || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || "";
 const TIME_ZONE = "Asia/Kolkata";
 const DOCS_DIR = path.join(process.cwd(), "documents");
+const PUBLIC_DIR = path.join(process.cwd(), "public"); // <--- NEW PUBLIC FOLDER
 
 // --- AUTH SETUP ---
-const SCOPES = [
-    "https://www.googleapis.com/auth/calendar", 
-    "https://www.googleapis.com/auth/calendar.events",
-    "https://www.googleapis.com/auth/drive"
-];
+const SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/calendar.events"];
 let auth: any;
 
 try {
@@ -52,10 +45,12 @@ try {
 } catch (error: any) { console.error("AUTH ERROR:", error.message); }
 
 const calendar = google.calendar({ version: "v3", auth });
-const drive = google.drive({ version: "v3", auth });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- HELPERS ---
+// --- HELPER: ENSURE DIRECTORIES EXIST ---
+if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR);
+
+// --- HELPER: DOC LOADER ---
 let documentKnowledge: { filename: string; content: string }[] = [];
 async function loadDocuments() {
   if (!fs.existsSync(DOCS_DIR)) fs.mkdirSync(DOCS_DIR);
@@ -109,25 +104,17 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   return freeSlots;
 }
 
-// --- ROBUST EMAILER ---
-const createTransporter = () => {
-    return nodemailer.createTransport({
-        service: "gmail", // Use built-in service to handle handshake
-        auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-    });
-};
-
-function createICS(title: string, start: Date, end: Date) {
-    const formatDate = (date: Date) => date.toISOString().replace(/-|:|\.\d+/g, "");
-    return `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//VoiceAgent//EN\nBEGIN:VEVENT\nUID:${Date.now()}@voiceagent\nDTSTAMP:${formatDate(new Date())}\nDTSTART:${formatDate(start)}\nDTEND:${formatDate(end)}\nSUMMARY:${title}\nEND:VEVENT\nEND:VCALENDAR`;
-}
-
 // --- SERVER ---
 const app = express();
 app.use(cors());
-const mcp = new McpServer({ name: "VoiceAgent", version: "6.0.0" });
 
-// TOOLS 1-4
+// *** STATIC FILE SERVER ***
+// This allows files in the 'public' folder to be downloaded via URL
+app.use('/files', express.static(PUBLIC_DIR));
+
+const mcp = new McpServer({ name: "VoiceAgent", version: "7.0.0" });
+
+// TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
     try {
       console.log(`[Check] Checking ${date} in ${TIME_ZONE}`);
@@ -149,35 +136,35 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
     } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
 });
 
+// TOOL 2: BOOKING (NATIVE GOOGLE EMAIL)
 mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
       console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
       const start = new Date(dateTime);
       const end = new Date(start.getTime() + 30 * 60000); 
+
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
+        sendUpdates: 'all', // <--- THE MAGIC FIX: TELLS GOOGLE TO SEND THE INVITE
         requestBody: {
-            summary: `${title} (Guest: ${attendeeEmail})`, 
-            description: `GUEST: ${attendeeEmail}\nBooked via Voice Agent.`,
+            summary: `${title}`, 
+            description: `Booked via Voice Agent.`,
             start: { dateTime: start.toISOString() },
             end: { dateTime: end.toISOString() },
+            attendees: [
+                { email: attendeeEmail } // <--- GOOGLE WILL EMAIL THIS PERSON
+            ]
         }
       });
-      // Try Email
-      try {
-          const transporter = createTransporter();
-          await transporter.sendMail({
-              from: `"Voice Agent" <${EMAIL_USER}>`, to: attendeeEmail, subject: `Confirmed: ${title}`,
-              text: `Confirmed for ${start.toLocaleString("en-US", { timeZone: TIME_ZONE })}.`,
-              attachments: [{ filename: 'invite.ics', content: createICS(title, start, end), contentType: 'text/calendar' }]
-          });
-          return { content: [{ type: "text", text: `Success. Booked and emailed.` }] };
-      } catch (e) {
-          return { content: [{ type: "text", text: `Booked on calendar (Email failed).` }] };
-      }
-    } catch (error: any) { return { content: [{ type: "text", text: "Error booking slot." }] }; }
+      
+      return { content: [{ type: "text", text: `Success. I have booked the slot and Google Calendar has sent an invite to ${attendeeEmail}.` }] };
+    } catch (error: any) { 
+        console.error("BOOKING ERROR:", error);
+        return { content: [{ type: "text", text: "Error booking slot." }] }; 
+    }
 });
 
+// TOOL 3: SEARCH
 mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   const keywords = query.toLowerCase().split(" ").filter(w => w.length > 3);
   const results = documentKnowledge.map(doc => {
@@ -189,15 +176,7 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
-mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }, async ({ to, subject, body }) => {
-      try {
-        const transporter = createTransporter();
-        await transporter.sendMail({ from: `"Voice Agent" <${EMAIL_USER}>`, to, subject, text: body });
-        return { content: [{ type: "text", text: `Email sent.` }] };
-      } catch (error) { return { content: [{ type: "text", text: "Failed to send email." }] }; }
-});
-
-// TOOL 5: GENERATE COLLATERAL (WITH FALLBACK)
+// TOOL 4: GENERATE COLLATERAL (HOSTED ON SERVER)
 mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
       console.log(`[AI-Write] Generating ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
@@ -213,36 +192,24 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
         aiContent = completion.choices[0]?.message?.content || "Error generating text.";
       } catch (err) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
 
-      // --- STRATEGY: DRIVE -> then EMAIL -> then CHAT ---
+      // --- SAVE TO PUBLIC FOLDER ---
       try {
-        // 1. Try Drive
-        const fileMetadata: any = { name: `${topic} - ${format} (Draft)`, mimeType: 'application/vnd.google-apps.document' };
-        if (DRIVE_FOLDER_ID) fileMetadata.parents = [DRIVE_FOLDER_ID];
-        const media = { mimeType: 'text/plain', body: aiContent };
-        const file = await drive.files.create({ requestBody: fileMetadata, media: media, fields: 'id, webViewLink' });
-        return { content: [{ type: "text", text: `Created Google Doc: ${file.data.webViewLink}` }] };
+        const safeName = `${topic.replace(/[^a-z0-9]/gi, '_')}_${format.replace(/[^a-z0-9]/gi, '_')}.txt`;
+        const filePath = path.join(PUBLIC_DIR, safeName);
+        
+        fs.writeFileSync(filePath, aiContent);
+        
+        // Construct the download URL dynamically
+        // Note: Render sets the host automatically, but we can't always guess it perfectly in code.
+        // We will return a relative path that Vapi can read, or hardcode the base if known.
+        // For now, let's assume we are on the Render URL.
+        const downloadUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || "your-app-name.onrender.com"}/files/${safeName}`;
 
-      } catch (driveErr: any) {
-          console.error("DRIVE FAILED (Quota). Switching to Email...");
-          
-          // 2. Fallback to Email
-          try {
-              if (EMAIL_USER) {
-                  const transporter = createTransporter();
-                  await transporter.sendMail({
-                      from: `"Voice Agent" <${EMAIL_USER}>`,
-                      to: EMAIL_USER, // Email it to YOU (the admin)
-                      subject: `Draft: ${topic}`,
-                      text: `Google Drive upload failed (Quota), so here is the generated text:\n\n${aiContent}`
-                  });
-                  return { content: [{ type: "text", text: `I couldn't save to Drive (storage full), so I emailed the draft to you instead.` }] };
-              }
-          } catch (emailErr) {
-              console.error("EMAIL FAILED.");
-          }
-          
-          // 3. Last Resort: Return Text
-          return { content: [{ type: "text", text: `I couldn't save to Drive or Email. Here is the draft:\n\n${aiContent.substring(0, 1000)}... (truncated)` }] };
+        return { content: [{ type: "text", text: `I have created the document. You can view or download it here: ${downloadUrl}` }] };
+
+      } catch (err: any) {
+          console.error("FILE SAVE ERROR:", err);
+          return { content: [{ type: "text", text: "Error saving file." }] };
       }
 });
 
