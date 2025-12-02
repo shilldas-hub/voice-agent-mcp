@@ -7,7 +7,7 @@ import { google } from "googleapis";
 import path from "path";
 import fs from "fs";
 import OpenAI from "openai";
-import PDFDocument from "pdfkit";
+import PDFDocument from "pdfkit"; // <--- ENSURE THIS IS HERE
 
 // --- LIBRARY LOADER ---
 import { createRequire } from "module";
@@ -18,10 +18,12 @@ try { pdfLib = require("pdf-extraction"); } catch (e) { console.error("Warning: 
 let mammoth: any;
 try { mammoth = require("mammoth"); } catch (e) { console.error("Warning: Could not load mammoth."); }
 
-// --- CONFIGURATION ---
+// --- CONFIGURATION (GLOBAL SCOPE) ---
 const CALENDAR_ID = process.env.CALENDAR_ID || ""; 
+const EMAIL_USER = process.env.EMAIL_USER || ""; // <--- ENSURE THIS IS HERE
+const EMAIL_PASS = process.env.EMAIL_PASS || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const EMAIL_WEBHOOK_URL = process.env.EMAIL_WEBHOOK_URL || ""; // <--- NEW SECRET
+const EMAIL_WEBHOOK_URL = process.env.EMAIL_WEBHOOK_URL || "";
 const TIME_ZONE = "Asia/Kolkata";
 const DOCS_DIR = path.join(process.cwd(), "documents");
 const PUBLIC_DIR = path.join(process.cwd(), "public");
@@ -49,7 +51,14 @@ try {
 const calendar = google.calendar({ version: "v3", auth });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- HELPERS ---
+// --- HELPER: IST TIME PARSER ---
+function parseIST(dateStr: string): Date {
+    let clean = dateStr.replace(/Z$/, '').replace(/([+-]\d{2}:?\d{2})$/, '');
+    if (clean.length <= 10) clean += "T00:00:00";
+    return new Date(`${clean}+05:30`);
+}
+
+// --- HELPER: DOC LOADER ---
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR);
 
 let documentKnowledge: { filename: string; content: string }[] = [];
@@ -77,11 +86,12 @@ async function loadDocuments() {
 
 function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   const freeSlots = [];
-  const startOfDay = new Date(dateStr); 
-  const endOfDay = new Date(dateStr); 
+  const startOfDay = parseIST(dateStr); 
+  const endOfDay = new Date(startOfDay); 
   endOfDay.setHours(23, 59, 59);
 
   let candidateTime = new Date(startOfDay.getTime());
+  candidateTime.setHours(9, 0, 0, 0); 
 
   while (candidateTime < endOfDay) {
     const istTimeStr = candidateTime.toLocaleString("en-US", { timeZone: TIME_ZONE, hour12: false, hour: "numeric", minute: "numeric" });
@@ -105,27 +115,15 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   return freeSlots;
 }
 
-// --- NEW EMAIL SYSTEM (VIA GOOGLE SCRIPT) ---
+// --- EMAIL RELAY ---
 async function sendEmailViaRelay(to: string, subject: string, body: string, icsContent?: string) {
-    if (!EMAIL_WEBHOOK_URL) {
-        console.error("Missing EMAIL_WEBHOOK_URL in Render");
-        return;
-    }
+    if (!EMAIL_WEBHOOK_URL) return;
     try {
-        console.log(`[Email] Signaling Satellite to send email to ${to}...`);
-        const response = await fetch(EMAIL_WEBHOOK_URL, {
+        await fetch(EMAIL_WEBHOOK_URL, {
             method: 'POST',
-            body: JSON.stringify({
-                to: to,
-                subject: subject,
-                body: body,
-                ics: icsContent
-            })
+            body: JSON.stringify({ to, subject, body, ics: icsContent })
         });
-        console.log(`[Email] Satellite Response: ${response.status}`);
-    } catch (e) {
-        console.error("[Email] Satellite Failed:", e);
-    }
+    } catch (e) { console.error("Email Relay Failed:", e); }
 }
 
 function createICS(title: string, start: Date, end: Date) {
@@ -138,16 +136,20 @@ const app = express();
 app.use(cors());
 app.use('/files', express.static(PUBLIC_DIR));
 
-const mcp = new McpServer({ name: "VoiceAgent", version: "10.0.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "11.1.0" });
 
 // TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
     try {
-      console.log(`[Check] Checking ${date} in ${TIME_ZONE}`);
+      console.log(`[Check] Checking ${date} (IST)`);
+      const start = parseIST(date);
+      const end = new Date(start); 
+      end.setHours(23, 59, 59);
+
       const res = await calendar.events.list({
         calendarId: CALENDAR_ID,
-        timeMin: new Date(date).toISOString(),
-        timeMax: new Date(new Date(date).getTime() + 86400000).toISOString(),
+        timeMin: start.toISOString(),
+        timeMax: end.toISOString(),
         timeZone: TIME_ZONE,
         singleEvents: true, 
         orderBy: 'startTime'
@@ -162,14 +164,14 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
     } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
 });
 
-// TOOL 2: BOOKING (WITH SATELLITE EMAIL)
+// TOOL 2: BOOKING
 mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
-      console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
-      const start = new Date(dateTime);
+      const start = parseIST(dateTime); 
       const end = new Date(start.getTime() + 30 * 60000); 
+      
+      console.log(`[Book] ${title} at ${start.toISOString()}`);
 
-      // 1. Book Calendar (No Invite from Google)
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
         requestBody: {
@@ -180,7 +182,6 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
         }
       });
 
-      // 2. Trigger Satellite Email (Reliable)
       const ics = createICS(title, start, end);
       await sendEmailViaRelay(
           attendeeEmail, 
@@ -189,7 +190,7 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
           ics
       );
       
-      return { content: [{ type: "text", text: `Success. Booked calendar and sent confirmation email.` }] };
+      return { content: [{ type: "text", text: `Success. Booked for ${start.toLocaleTimeString("en-US", { timeZone: TIME_ZONE })} IST.` }] };
     } catch (error: any) { 
         console.error("BOOKING ERROR:", error);
         return { content: [{ type: "text", text: "Error booking slot." }] }; 
@@ -214,7 +215,7 @@ mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }
       return { content: [{ type: "text", text: `Email sent via relay.` }] };
 });
 
-// TOOL 5: GENERATE PDF (HOSTED LINK)
+// TOOL 5: GENERATE PDF
 mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
       console.log(`[AI-Write] Generating PDF: ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
@@ -248,8 +249,10 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
         const host = process.env.RENDER_EXTERNAL_HOSTNAME || "your-app.onrender.com";
         const downloadUrl = `https://${host}/files/${safeName}`;
 
-        // Also email it just in case
-        await sendEmailViaRelay(EMAIL_USER, `Generated PDF: ${topic}`, `Here is the document: ${downloadUrl}`);
+        // Also email it if possible
+        if (EMAIL_USER) {
+            await sendEmailViaRelay(EMAIL_USER, `Generated PDF: ${topic}`, `Here is the document: ${downloadUrl}`);
+        }
 
         return { content: [{ type: "text", text: `I have created a PDF. You can download it here: ${downloadUrl}. I also emailed you a copy.` }] };
 
