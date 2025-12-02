@@ -21,6 +21,7 @@ try { mammoth = require("mammoth"); } catch (e) { console.error("Warning: Could 
 // --- CONFIGURATION ---
 const CALENDAR_ID = process.env.CALENDAR_ID || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const EMAIL_WEBHOOK_URL = process.env.EMAIL_WEBHOOK_URL || ""; // <--- NEW SECRET
 const TIME_ZONE = "Asia/Kolkata";
 const DOCS_DIR = path.join(process.cwd(), "documents");
 const PUBLIC_DIR = path.join(process.cwd(), "public");
@@ -104,12 +105,40 @@ function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   return freeSlots;
 }
 
+// --- NEW EMAIL SYSTEM (VIA GOOGLE SCRIPT) ---
+async function sendEmailViaRelay(to: string, subject: string, body: string, icsContent?: string) {
+    if (!EMAIL_WEBHOOK_URL) {
+        console.error("Missing EMAIL_WEBHOOK_URL in Render");
+        return;
+    }
+    try {
+        console.log(`[Email] Signaling Satellite to send email to ${to}...`);
+        const response = await fetch(EMAIL_WEBHOOK_URL, {
+            method: 'POST',
+            body: JSON.stringify({
+                to: to,
+                subject: subject,
+                body: body,
+                ics: icsContent
+            })
+        });
+        console.log(`[Email] Satellite Response: ${response.status}`);
+    } catch (e) {
+        console.error("[Email] Satellite Failed:", e);
+    }
+}
+
+function createICS(title: string, start: Date, end: Date) {
+    const formatDate = (date: Date) => date.toISOString().replace(/-|:|\.\d+/g, "");
+    return `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//VoiceAgent//EN\nBEGIN:VEVENT\nUID:${Date.now()}@voiceagent\nDTSTAMP:${formatDate(new Date())}\nDTSTART:${formatDate(start)}\nDTEND:${formatDate(end)}\nSUMMARY:${title}\nEND:VEVENT\nEND:VCALENDAR`;
+}
+
 // --- SERVER ---
 const app = express();
 app.use(cors());
 app.use('/files', express.static(PUBLIC_DIR));
 
-const mcp = new McpServer({ name: "VoiceAgent", version: "9.1.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "10.0.0" });
 
 // TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
@@ -133,13 +162,14 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
     } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
 });
 
-// TOOL 2: BOOKING
+// TOOL 2: BOOKING (WITH SATELLITE EMAIL)
 mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
       console.log(`[Book] ${title} for ${attendeeEmail} at ${dateTime}`);
       const start = new Date(dateTime);
       const end = new Date(start.getTime() + 30 * 60000); 
 
+      // 1. Book Calendar (No Invite from Google)
       await calendar.events.insert({
         calendarId: CALENDAR_ID,
         requestBody: {
@@ -149,8 +179,17 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
             end: { dateTime: end.toISOString() },
         }
       });
+
+      // 2. Trigger Satellite Email (Reliable)
+      const ics = createICS(title, start, end);
+      await sendEmailViaRelay(
+          attendeeEmail, 
+          `Confirmed: ${title}`, 
+          `Your appointment is confirmed for ${start.toLocaleString("en-US", { timeZone: TIME_ZONE })}.\n\nSee attached invite.`,
+          ics
+      );
       
-      return { content: [{ type: "text", text: `Success. I have booked the slot on your calendar. I have noted the guest email (${attendeeEmail}) in the description.` }] };
+      return { content: [{ type: "text", text: `Success. Booked calendar and sent confirmation email.` }] };
     } catch (error: any) { 
         console.error("BOOKING ERROR:", error);
         return { content: [{ type: "text", text: "Error booking slot." }] }; 
@@ -169,7 +208,13 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
-// TOOL 4: GENERATE PDF COLLATERAL
+// TOOL 4: SEND EMAIL (VIA SATELLITE)
+mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }, async ({ to, subject, body }) => {
+      await sendEmailViaRelay(to, subject, body);
+      return { content: [{ type: "text", text: `Email sent via relay.` }] };
+});
+
+// TOOL 5: GENERATE PDF (HOSTED LINK)
 mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
       console.log(`[AI-Write] Generating PDF: ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
@@ -180,7 +225,7 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
       try {
         const completion = await openai.chat.completions.create({
             model: "gpt-4o",
-            messages: [{ role: "system", content: `Write a ${format}. Do not use Markdown symbols like ** or #. Just plain text with clear paragraphs.` }, { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }]
+            messages: [{ role: "system", content: `Write a ${format}. Plain text paragraphs.` }, { role: "user", content: `TOPIC: ${topic}\nCONTEXT:\n${contextText}` }]
         });
         aiContent = completion.choices[0]?.message?.content || "Error generating text.";
       } catch (err) { return { content: [{ type: "text", text: "AI Generation failed." }] }; }
@@ -192,12 +237,9 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
         const doc = new PDFDocument();
         const stream = fs.createWriteStream(filePath);
         doc.pipe(stream);
-
         doc.fontSize(20).text(topic.toUpperCase(), { align: 'center' });
         doc.moveDown();
-        doc.fontSize(12).text(`Format: ${format}`, { align: 'center' });
-        doc.moveDown();
-        doc.fontSize(12).text(aiContent, { align: 'justify', indent: 30, lineGap: 5 });
+        doc.fontSize(12).text(aiContent, { align: 'justify', indent: 30 });
         doc.end();
 
         // FIX: Explicit void resolve
@@ -206,7 +248,10 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
         const host = process.env.RENDER_EXTERNAL_HOSTNAME || "your-app.onrender.com";
         const downloadUrl = `https://${host}/files/${safeName}`;
 
-        return { content: [{ type: "text", text: `I have created a PDF document. You can download it here: ${downloadUrl}` }] };
+        // Also email it just in case
+        await sendEmailViaRelay(EMAIL_USER, `Generated PDF: ${topic}`, `Here is the document: ${downloadUrl}`);
+
+        return { content: [{ type: "text", text: `I have created a PDF. You can download it here: ${downloadUrl}. I also emailed you a copy.` }] };
 
       } catch (err: any) {
           console.error("PDF SAVE ERROR:", err);
