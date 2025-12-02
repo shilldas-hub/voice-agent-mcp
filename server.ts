@@ -22,6 +22,7 @@ try { mammoth = require("mammoth"); } catch (e) { console.error("Warning: Could 
 const CALENDAR_ID = process.env.CALENDAR_ID || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const EMAIL_WEBHOOK_URL = process.env.EMAIL_WEBHOOK_URL || "";
+const EMAIL_USER = process.env.EMAIL_USER || ""; // Used for self-notification
 const TIME_ZONE = "Asia/Kolkata";
 const DOCS_DIR = path.join(process.cwd(), "documents");
 const PUBLIC_DIR = path.join(process.cwd(), "public");
@@ -51,8 +52,11 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // --- HELPER: FORCE IST PARSING ---
 function parseIST(dateStr: string): Date {
+    // 1. Clean up the string
     let clean = dateStr.replace(/Z$/, '').replace(/([+-]\d{2}:?\d{2})$/, '');
+    // 2. If it's just YYYY-MM-DD, add midnight
     if (clean.length <= 10) clean += "T00:00:00";
+    // 3. Force +05:30 offset
     return new Date(`${clean}+05:30`);
 }
 
@@ -82,32 +86,49 @@ async function loadDocuments() {
   console.log(`Loaded ${documentKnowledge.length} docs.`);
 }
 
+// --- FIXED: MATH-BASED AVAILABILITY CHECK ---
 function calculateFreeSlots(dateStr: string, busyEvents: any[]) {
   const freeSlots = [];
-  const startOfDay = parseIST(dateStr); 
-  const endOfDay = new Date(startOfDay); 
-  endOfDay.setHours(23, 59, 59);
+  
+  // 1. Get Midnight IST for the requested date
+  const startOfDayIST = parseIST(dateStr); 
+  
+  // 2. Define Work Hours (9 AM to 5 PM IST) using pure timestamps
+  // We add hours in milliseconds (Hour * 60 * 60 * 1000)
+  // This ignores the Render Server's UTC clock entirely.
+  const workStart = new Date(startOfDayIST.getTime() + (9 * 60 * 60 * 1000)); 
+  const workEnd = new Date(startOfDayIST.getTime() + (17 * 60 * 60 * 1000));
 
-  let candidateTime = new Date(startOfDay.getTime());
-  candidateTime.setHours(9, 0, 0, 0); 
+  let candidateTime = new Date(workStart);
 
-  while (candidateTime < endOfDay) {
-    const istTimeStr = candidateTime.toLocaleString("en-US", { timeZone: TIME_ZONE, hour12: false, hour: "numeric", minute: "numeric" });
-    const [hourStr, minuteStr] = istTimeStr.split(":");
-    const hour = parseInt(hourStr || "0");
+  while (candidateTime < workEnd) {
+    // 3. Define the slot window (30 mins)
+    const slotEnd = new Date(candidateTime.getTime() + 30 * 60000);
 
-    if (hour >= 9 && hour < 17) {
-        const isBusy = busyEvents.some((event: any) => {
-            const eventStart = new Date(event.start.dateTime || event.start.date);
-            const eventEnd = new Date(event.end.dateTime || event.end.date);
-            if (!event.start.dateTime) return eventStart.toISOString().slice(0,10) === candidateTime.toISOString().slice(0,10);
-            return candidateTime >= eventStart && candidateTime < eventEnd;
-        });
-        if (!isBusy) {
-            const slotLabel = candidateTime.toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit' });
-            freeSlots.push(slotLabel);
+    // 4. Check for Overlaps with Busy Events
+    const isBusy = busyEvents.some((event: any) => {
+        const eventStart = new Date(event.start.dateTime || event.start.date);
+        const eventEnd = new Date(event.end.dateTime || event.end.date);
+
+        // All-Day Logic
+        if (!event.start.dateTime) {
+             const eventDateStr = eventStart.toISOString().slice(0,10);
+             const candidateDateStr = candidateTime.toISOString().slice(0,10);
+             return eventDateStr === candidateDateStr;
         }
+
+        // Strict Overlap Logic:
+        // (Start < SlotEnd) AND (End > SlotStart)
+        return eventStart < slotEnd && eventEnd > candidateTime;
+    });
+
+    if (!isBusy) {
+        // Format nicely for the Voice Agent to read
+        const slotLabel = candidateTime.toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit' });
+        freeSlots.push(slotLabel);
     }
+
+    // Advance 30 mins
     candidateTime = new Date(candidateTime.getTime() + 30 * 60000);
   }
   return freeSlots;
@@ -134,22 +155,31 @@ const app = express();
 app.use(cors());
 app.use('/files', express.static(PUBLIC_DIR));
 
-const mcp = new McpServer({ name: "VoiceAgent", version: "12.0.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "13.0.0" });
 
 // TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
     try {
       console.log(`[Check] Checking ${date} (IST)`);
+      // Force IST Search Range
       const start = parseIST(date);
-      const end = new Date(start); end.setHours(23, 59, 59);
+      const end = new Date(start); 
+      end.setHours(23, 59, 59);
+
       const res = await calendar.events.list({
-        calendarId: CALENDAR_ID, timeMin: start.toISOString(), timeMax: end.toISOString(), timeZone: TIME_ZONE, singleEvents: true, orderBy: 'startTime'
+        calendarId: CALENDAR_ID,
+        timeMin: start.toISOString(),
+        timeMax: end.toISOString(),
+        timeZone: TIME_ZONE,
+        singleEvents: true, 
+        orderBy: 'startTime'
       });
       const events = res.data.items || [];
       const busyList = events.map((e: any) => {
         const t = e.start.dateTime ? new Date(e.start.dateTime).toLocaleTimeString("en-US", { timeZone: TIME_ZONE, hour: '2-digit', minute:'2-digit'}) : "All Day";
         return `BUSY: ${t} - ${e.summary}`;
       }).join("\n");
+      
       const availableSlots = calculateFreeSlots(date, events);
       return { content: [{ type: "text", text: `STATUS FOR ${date} (${TIME_ZONE}):\n⛔ BUSY:\n${busyList || "None"}\n✅ AVAILABLE:\n${availableSlots.length > 0 ? availableSlots.join(", ") : "None"}` }] };
     } catch (e: any) { return { content: [{ type: "text", text: "Error checking calendar." }] }; }
@@ -158,6 +188,7 @@ mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) =
 // TOOL 2: BOOKING
 mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendeeEmail: z.string() }, async ({ title, dateTime, attendeeEmail }) => {
     try {
+      // Force input to IST
       const start = parseIST(dateTime); 
       const end = new Date(start.getTime() + 30 * 60000); 
       console.log(`[Book] ${title} at ${start.toISOString()}`);
@@ -199,15 +230,14 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
-// TOOL 4: GENERATE PDF & EMAIL IT
-mcp.tool(
-    "generate_collateral", 
-    { 
-        topic: z.string().describe("Topic (e.g. 'Refund Policy')"), 
-        format: z.string().describe("Format (e.g. 'Summary')"),
-        recipientEmail: z.string().optional().describe("User's email to send the PDF to") 
-    }, 
-    async ({ topic, format, recipientEmail }) => {
+// TOOL 4: SEND EMAIL
+mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }, async ({ to, subject, body }) => {
+      await sendEmailViaRelay(to, subject, body);
+      return { content: [{ type: "text", text: `Email sent via relay.` }] };
+});
+
+// TOOL 5: GENERATE PDF
+mcp.tool("generate_collateral", { topic: z.string(), format: z.string(), recipientEmail: z.string().optional() }, async ({ topic, format, recipientEmail }) => {
       console.log(`[AI-Write] Generating PDF: ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
       const relevantDocs = documentKnowledge.filter(d => d.content.toLowerCase().includes(searchKeyword)).slice(0, 2);
@@ -239,22 +269,11 @@ mcp.tool(
         const host = process.env.RENDER_EXTERNAL_HOSTNAME || "your-app.onrender.com";
         const downloadUrl = `https://${host}/files/${safeName}`;
 
-        let message = `I have created the PDF. You can view it here: ${downloadUrl}`;
-
-        // --- EMAIL LOGIC ---
         if (recipientEmail) {
-            console.log(`[Email] Sending PDF link to ${recipientEmail}`);
-            await sendEmailViaRelay(
-                recipientEmail, 
-                `Your requested document: ${topic}`, 
-                `Here is the ${format} you requested.\n\nDownload Link: ${downloadUrl}`
-            );
-            message += `\nI have also emailed it to ${recipientEmail}.`;
-        } else {
-            message += `\n(I didn't send an email because no address was provided).`;
+            await sendEmailViaRelay(recipientEmail, `Generated PDF: ${topic}`, `Here is the document: ${downloadUrl}`);
         }
 
-        return { content: [{ type: "text", text: message }] };
+        return { content: [{ type: "text", text: `I have created a PDF. Download link: ${downloadUrl}` }] };
 
       } catch (err: any) {
           console.error("PDF SAVE ERROR:", err);
