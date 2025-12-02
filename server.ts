@@ -7,7 +7,7 @@ import { google } from "googleapis";
 import path from "path";
 import fs from "fs";
 import OpenAI from "openai";
-import PDFDocument from "pdfkit"; // <--- ENSURE THIS IS HERE
+import PDFDocument from "pdfkit";
 
 // --- LIBRARY LOADER ---
 import { createRequire } from "module";
@@ -18,10 +18,8 @@ try { pdfLib = require("pdf-extraction"); } catch (e) { console.error("Warning: 
 let mammoth: any;
 try { mammoth = require("mammoth"); } catch (e) { console.error("Warning: Could not load mammoth."); }
 
-// --- CONFIGURATION (GLOBAL SCOPE) ---
+// --- CONFIGURATION ---
 const CALENDAR_ID = process.env.CALENDAR_ID || ""; 
-const EMAIL_USER = process.env.EMAIL_USER || ""; // <--- ENSURE THIS IS HERE
-const EMAIL_PASS = process.env.EMAIL_PASS || ""; 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const EMAIL_WEBHOOK_URL = process.env.EMAIL_WEBHOOK_URL || "";
 const TIME_ZONE = "Asia/Kolkata";
@@ -51,7 +49,7 @@ try {
 const calendar = google.calendar({ version: "v3", auth });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- HELPER: IST TIME PARSER ---
+// --- HELPER: FORCE IST PARSING ---
 function parseIST(dateStr: string): Date {
     let clean = dateStr.replace(/Z$/, '').replace(/([+-]\d{2}:?\d{2})$/, '');
     if (clean.length <= 10) clean += "T00:00:00";
@@ -136,23 +134,16 @@ const app = express();
 app.use(cors());
 app.use('/files', express.static(PUBLIC_DIR));
 
-const mcp = new McpServer({ name: "VoiceAgent", version: "11.1.0" });
+const mcp = new McpServer({ name: "VoiceAgent", version: "12.0.0" });
 
 // TOOL 1: CHECK AVAILABILITY
 mcp.tool("check_calendar_availability", { date: z.string() }, async ({ date }) => {
     try {
       console.log(`[Check] Checking ${date} (IST)`);
       const start = parseIST(date);
-      const end = new Date(start); 
-      end.setHours(23, 59, 59);
-
+      const end = new Date(start); end.setHours(23, 59, 59);
       const res = await calendar.events.list({
-        calendarId: CALENDAR_ID,
-        timeMin: start.toISOString(),
-        timeMax: end.toISOString(),
-        timeZone: TIME_ZONE,
-        singleEvents: true, 
-        orderBy: 'startTime'
+        calendarId: CALENDAR_ID, timeMin: start.toISOString(), timeMax: end.toISOString(), timeZone: TIME_ZONE, singleEvents: true, orderBy: 'startTime'
       });
       const events = res.data.items || [];
       const busyList = events.map((e: any) => {
@@ -169,7 +160,6 @@ mcp.tool("book_appointment", { title: z.string(), dateTime: z.string(), attendee
     try {
       const start = parseIST(dateTime); 
       const end = new Date(start.getTime() + 30 * 60000); 
-      
       console.log(`[Book] ${title} at ${start.toISOString()}`);
 
       await calendar.events.insert({
@@ -209,14 +199,15 @@ mcp.tool("search_knowledge_base", { query: z.string() }, async ({ query }) => {
   return { content: [{ type: "text", text: `Found details:\n${snippets}` }] };
 });
 
-// TOOL 4: SEND EMAIL (VIA SATELLITE)
-mcp.tool("send_email", { to: z.string(), subject: z.string(), body: z.string() }, async ({ to, subject, body }) => {
-      await sendEmailViaRelay(to, subject, body);
-      return { content: [{ type: "text", text: `Email sent via relay.` }] };
-});
-
-// TOOL 5: GENERATE PDF
-mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async ({ topic, format }) => {
+// TOOL 4: GENERATE PDF & EMAIL IT
+mcp.tool(
+    "generate_collateral", 
+    { 
+        topic: z.string().describe("Topic (e.g. 'Refund Policy')"), 
+        format: z.string().describe("Format (e.g. 'Summary')"),
+        recipientEmail: z.string().optional().describe("User's email to send the PDF to") 
+    }, 
+    async ({ topic, format, recipientEmail }) => {
       console.log(`[AI-Write] Generating PDF: ${format}...`);
       const searchKeyword = topic.toLowerCase().split(" ")[0] || "";
       const relevantDocs = documentKnowledge.filter(d => d.content.toLowerCase().includes(searchKeyword)).slice(0, 2);
@@ -243,18 +234,27 @@ mcp.tool("generate_collateral", { topic: z.string(), format: z.string() }, async
         doc.fontSize(12).text(aiContent, { align: 'justify', indent: 30 });
         doc.end();
 
-        // FIX: Explicit void resolve
         await new Promise<void>((resolve) => stream.on('finish', () => resolve()));
         
         const host = process.env.RENDER_EXTERNAL_HOSTNAME || "your-app.onrender.com";
         const downloadUrl = `https://${host}/files/${safeName}`;
 
-        // Also email it if possible
-        if (EMAIL_USER) {
-            await sendEmailViaRelay(EMAIL_USER, `Generated PDF: ${topic}`, `Here is the document: ${downloadUrl}`);
+        let message = `I have created the PDF. You can view it here: ${downloadUrl}`;
+
+        // --- EMAIL LOGIC ---
+        if (recipientEmail) {
+            console.log(`[Email] Sending PDF link to ${recipientEmail}`);
+            await sendEmailViaRelay(
+                recipientEmail, 
+                `Your requested document: ${topic}`, 
+                `Here is the ${format} you requested.\n\nDownload Link: ${downloadUrl}`
+            );
+            message += `\nI have also emailed it to ${recipientEmail}.`;
+        } else {
+            message += `\n(I didn't send an email because no address was provided).`;
         }
 
-        return { content: [{ type: "text", text: `I have created a PDF. You can download it here: ${downloadUrl}. I also emailed you a copy.` }] };
+        return { content: [{ type: "text", text: message }] };
 
       } catch (err: any) {
           console.error("PDF SAVE ERROR:", err);
